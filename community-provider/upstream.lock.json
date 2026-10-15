@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/hqqw2h-lgtm/keycloak-services-social-wecom",
+  "commit": "a777528752f8b75edd1cf769297ef8c52d72678c",
+  "archive_sha256": "3936f2e016535aa3ea18b63ac739b632de303d411ccbf97449a0ca205739036b",
+  "license": "MIT",
+  "artifact_version": "0.1.0",
+  "upstream_compile_keycloak": "26.7.0",
+  "tested_runtime_keycloak": "26.6.4",
+  "provider_id": "wecom",
+  "source_modifications": false,
+  "support": "Independent community project; no Keycloak/AWS commercial support implied"
+}

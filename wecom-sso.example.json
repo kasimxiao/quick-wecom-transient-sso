@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "origin": "https://sso.example.com",
+  "realm": "customer-quick",
+  "aws_account": "123456789012",
+  "region": "ap-northeast-1",
+  "corp_id": "ww0000000000000000",
+  "agent_id": "1000003",
+  "secret_parameter": "/customer-quick/wecom-secret",
+  "portal_managed": true,
+  "saml_alias": "quick-web",
+  "users": [{
+    "kc_id": "00000000-0000-0000-0000-000000000001",
+    "username": "employee-one",
+    "email": "one@example.com",
+    "wecom_user_id": "MemberOne",
+    "quick_username": "CustomerQuickRole/employee-one",
+    "role_arn": "arn:aws:iam::123456789012:role/CustomerQuickRole",
+    "provider_arn": "arn:aws:iam::123456789012:saml-provider/CustomerQuick"
+  }]
+}

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "origin": "https://sso.example.com",
+  "realm": "customer-quick",
+  "aws_account": "123456789012",
+  "region": "ap-northeast-1",
+  "corp_id": "ww0000000000000000",
+  "agent_id": "1000003",
+  "secret_parameter": "/customer-quick/wecom-secret",
+  "saml_alias": "quick-web",
+  "users": [
+    {"username": "employee-one", "email": "employee.one@example.com", "wecom_user_id": "MemberOne", "quick_role": "READER_PRO"}
+  ]
+}
