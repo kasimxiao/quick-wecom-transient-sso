@@ -14,7 +14,7 @@ import time
 import traceback
 import urllib.error
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_transient as m
 

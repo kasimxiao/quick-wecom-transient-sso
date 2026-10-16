@@ -4,11 +4,11 @@ import argparse
 import json
 from pathlib import Path
 import sys
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_cleanup as cleanup
 import mapped_sso as sso
-from scripts.migrate_mapped_transient import authenticate,contracts,write_private
+from migrate_mapped_transient import authenticate,contracts,write_private
 
 
 def main():

@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 import sys
 import traceback
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_sso as sso
-from scripts.migrate_mapped_transient import authenticate,contracts
+from migrate_mapped_transient import authenticate,contracts
 
 
 def main():

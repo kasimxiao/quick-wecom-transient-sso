@@ -5,18 +5,14 @@ node_modules/
 dist/
 target/
 *.jar
+!provider/quick-wecom-mapped-transient-1.1.0.jar
 *.html
 .DS_Store
 # Default-deny real customer manifests and generated identity/state artifacts.
 *.json
 !*.example.json
-!package.json
-!package-lock.json
-!community-provider/upstream.lock.json
 customer-run*/
 wecom-run*/
-shadow-run*/
-transient-run*/
 .customer-*/
 metadata.xml
 *.pem

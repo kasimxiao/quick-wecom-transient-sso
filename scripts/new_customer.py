@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 
 import wecom_sso as w
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 OWNER = 'quick.bootstrap.owner'
 ACS = 'https://signin.aws.amazon.com/saml'
 HOME_URL = 'https://quicksight.aws.amazon.com'
