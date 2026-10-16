@@ -8,7 +8,7 @@ import traceback
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_sso as sso
-from migrate_mapped_transient import authenticate,contracts
+from migrate_mapped_transient import authenticate,contracts,legacy_manifest
 
 
 def main():
@@ -16,7 +16,7 @@ def main():
     parser.add_argument('stage',choices=['prepare','enable','verify','rollback'])
     parser.add_argument('--config',required=True);parser.add_argument('--snapshot',required=True)
     parser.add_argument('--admin-secret-id');parser.add_argument('--confirm-target')
-    args=parser.parse_args();c=n.validate(json.loads(Path(args.config).read_text()))
+    args=parser.parse_args();c=legacy_manifest(json.loads(Path(args.config).read_text(),object_pairs_hook=n.w.unique_object))
     path=Path(args.snapshot);n.need(path.stat().st_mode&0o077==0,'Use a private mapping snapshot')
     snapshot=json.loads(path.read_text());policy=snapshot['policy']
     n.need(all(policy[a]==c[a] for a in ('realm','aws_account','corp_id','agent_id')),'Wrong snapshot target')

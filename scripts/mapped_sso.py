@@ -41,8 +41,14 @@ def verify(k,snapshot,active=True):
 def prepare(k,snapshot):
     """Create an unbound flow once; leave all existing login paths unchanged."""
     m.verify(k,snapshot,True)
+    create_flow(k,snapshot['policy'])
+    return verify(k,snapshot,False)
+
+
+def create_flow(k,policy):
+    """Create the guarded-cookie flow once for fresh deployments or migration."""
     info=k('/admin/serverinfo');m.need(COOKIE in info.get('providers',{}).get('authenticator',{}).get('providers',{}))
-    root='/admin/realms/'+snapshot['policy']['realm'];spec=specification(snapshot['policy'])
+    root='/admin/realms/'+policy['realm'];spec=specification(policy)
     m.need(not any(f['alias']==BROWSER for f in k(root+'/authentication/flows')))
     k(root+'/authentication/flows','POST',{'alias':BROWSER,'description':spec['description'],
         'providerId':'basic-flow','topLevel':True,'builtIn':False})
@@ -54,7 +60,7 @@ def prepare(k,snapshot):
         if want['provider']=='identity-provider-redirector':
             k(root+'/authentication/executions/'+actual[0]['id']+'/config','POST',
                 {'alias':CONFIG,'config':{'defaultProvider':m.ALIAS}})
-    return verify(k,snapshot,False)
+    verify_flow(k,{'policy':policy})
 
 
 def enable(k,snapshot):

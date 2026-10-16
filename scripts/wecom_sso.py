@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = '1.0.1'
+VERSION = '1.1.0'
 FLOW = 'wecom-prelinked-only'
 APPROVAL = 'portal.wecom.approval.v1'
 CAPABILITY = 'portal.wecom.adapter'
@@ -298,14 +298,16 @@ def apply(c,k,before,secret):
 
 class LoginLink(HTMLParser):
     """Read only the public WeCom button from a fresh login page."""
-    link=None
+    def __init__(self,alias='wecom'):
+        super().__init__();self.alias=alias;self.link=None
     def handle_starttag(self,tag,attrs):
         a=dict(attrs)
-        if tag=='a' and a.get('id')=='social-wecom':self.link=a.get('href')
+        if tag=='a' and a.get('id')=='social-'+self.alias:self.link=a.get('href')
 
 
-def verify_http(c):
+def verify_http(c,alias='wecom'):
     """Verify SAML and OIDC reach the official QR endpoint; never scan or log tokens."""
+    need(alias in ('wecom','wecom-mapped'),'Unsupported broker alias')
     issuer=c['origin']+'/realms/'+c['realm']
     starts=[issuer+'/protocol/saml/clients/'+c['saml_alias'],
         issuer+'/protocol/openid-connect/auth?'+urllib.parse.urlencode({'client_id':'amazon-quick-desktop','redirect_uri':'http://localhost:18080',
@@ -320,14 +322,14 @@ def verify_http(c):
                 body=res.read().decode()
                 if res.code in (302,303):next_url=urllib.parse.urljoin(url,res.headers['Location'])
                 else:
-                    need(res.code==200,'Public login route failed');links=LoginLink();links.feed(body)
+                    need(res.code==200,'Public login route failed');links=LoginLink(alias);links.feed(body)
                     need(links.link,'WeCom login button missing');next_url=urllib.parse.urljoin(url,links.link)
             parsed=urllib.parse.urlsplit(next_url)
             if parsed.hostname=='login.work.weixin.qq.com':
                 q=urllib.parse.parse_qs(parsed.query)
                 need(parsed.scheme=='https' and parsed.path=='/wwlogin/sso/login'
                      and q.get('appid')==[c['corp_id']] and q.get('agentid')==[c['agent_id']]
-                     and q.get('redirect_uri')==[issuer+'/broker/wecom/endpoint'] and q.get('state'), 'Unexpected WeCom QR redirect')
+                     and q.get('redirect_uri')==[issuer+'/broker/'+alias+'/endpoint'] and q.get('state'), 'Unexpected WeCom QR redirect')
                 break
             need(parsed.scheme=='https' and parsed.netloc==urllib.parse.urlsplit(c['origin']).netloc,'Unexpected login redirect host');url=next_url
         else:raise ValueError('Too many login redirects')

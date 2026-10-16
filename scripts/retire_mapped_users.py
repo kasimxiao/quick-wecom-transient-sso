@@ -8,7 +8,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_cleanup as cleanup
 import mapped_sso as sso
-from migrate_mapped_transient import authenticate,contracts,write_private
+from migrate_mapped_transient import authenticate,contracts,write_private,legacy_manifest
 
 
 def main():
@@ -18,7 +18,7 @@ def main():
     p.add_argument('--config',required=True);p.add_argument('--snapshot',required=True)
     p.add_argument('--directory');p.add_argument('--admin-secret-id');p.add_argument('--confirm-target')
     p.add_argument('--confirm-user',action='append',default=[])
-    args=p.parse_args();c=n.validate(json.loads(Path(args.config).read_text()))
+    args=p.parse_args();c=legacy_manifest(json.loads(Path(args.config).read_text(),object_pairs_hook=n.w.unique_object))
     path=Path(args.snapshot);n.need(path.stat().st_mode&0o077==0,'Use a private snapshot')
     snapshot=json.loads(path.read_text());policy=snapshot['policy']
     n.need(all(policy[key]==c[key] for key in ('realm','aws_account','corp_id','agent_id')),'Wrong snapshot target')

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""First customer deployment from Keycloak 26.6.4 + community wecom.
+"""Zero-persistent-employee deployment: Keycloak 26.6.4 + wecom + mapped extension.
 
 No live writes by default. Quick subscription and console settings remain human
 gates. Each mutation needs account/Realm confirmation; paid users need a separate
 batch confirmation. Never adopts an existing deployment or updates IAM policies.
-Requires Python 3.10+, boto3, trusted administrator-authored configuration.
+Requires transient-users, Python 3.10+, boto3, approved administrator configuration.
+Creates no Keycloak employees or federated user links; users stage registers Quick seats only.
 """
 import argparse
-import copy
 import getpass
 import hashlib
 import json
@@ -22,8 +22,11 @@ import warnings
 import xml.etree.ElementTree as ET
 
 import wecom_sso as w
+import mapped_transient as m
+import mapped_sso as sso
 
-VERSION = '1.0.1'
+VERSION = '1.1.0'
+MODE = 'fresh-mapped-transient'
 OWNER = 'quick.bootstrap.owner'
 ACS = 'https://signin.aws.amazon.com/saml'
 HOME_URL = 'https://quicksight.aws.amazon.com'
@@ -59,6 +62,9 @@ def validate(c):
         need(isinstance(u,dict) and set(u)=={'username','email','wecom_user_id','quick_role'}
              and all(isinstance(v,str) for v in u.values()), 'Unexpected employee fields')
         need(re.fullmatch(r'[a-z0-9][a-z0-9._-]{1,63}',u['username']), 'Use a lowercase 2-64 character username')
+        need(re.fullmatch(r'[a-z0-9][a-z0-9._-]{1,63}',u['wecom_user_id']),
+             'Use the lowercase WeCom UserId: 2-64 letters/digits/dot/underscore/hyphen')
+        need(len(u['email'])<=254, 'Email exceeds runtime limit')
         need(u['quick_role'] in ('READER_PRO','AUTHOR_PRO'), 'Explicit READER_PRO or AUTHOR_PRO required; no admins')
     # Reuse the established input constraints; synthetic UUIDs are validation-only.
     probe = {k:v for k,v in c.items() if k!='users'} | {'portal_managed':False,'users':[]}
@@ -78,7 +84,7 @@ def plan(c):
     ns = names(c); issuer = c['origin']+'/realms/'+c['realm']
     users = [u | {'role_arn':'arn:aws:iam::'+c['aws_account']+':role/'+ns['roles'][u['username']],
                  'quick_username':ns['roles'][u['username']]+'/'+u['username']} for u in c['users']]
-    return {'version':VERSION,'mode':'offline_plan','existing_infrastructure':'Keycloak 26.6.4 + community wecom only',
+    return {'version':VERSION,'mode':'offline_plan','existing_infrastructure':'Keycloak 26.6.4 + community wecom + mapped extension + transient-users',
             'aws_account':c['aws_account'],'region':c['region'],'realm':c['realm'],
             'stack':ns['stack'],'provider_arn':ns['provider_arn'],'users':users,
             'confirm_target':c['aws_account']+'/'+c['realm'],
@@ -92,7 +98,7 @@ def plan(c):
                 'jwks_uri':issuer+'/protocol/openid-connect/certs',
                 'client_id':'amazon-quick-desktop','client_type':'PUBLIC','pkce':'S256',
                 'scopes':'openid profile email offline_access','callback':'http://localhost:18080',
-                'wecom_callback':issuer+'/broker/wecom/endpoint'},
+                'wecom_callback':issuer+'/broker/'+m.ALIAS+'/endpoint'},
             'manual':['Quick subscription/region and billing approval','WeCom app/member/domain/trusted IP',
                       'Quick SSO + extension access + Desktop extension','Actual scan and logout/relogin'],
             'subscription_created':False,'live_login_verified':False}
@@ -151,22 +157,30 @@ def private_write(path,value):
 
 class State:
     """Immutable customer binding and durable receipts; keep this directory to resume."""
-    def __init__(self,directory,c,create=False):
+    def __init__(self,directory,c,create=False,readonly=False):
+        self.readonly = readonly
+        need(not (create and readonly),'Cannot create read-only state')
         self.directory = Path(directory); self.path = self.directory/'state.json'
         need(not self.directory.is_symlink() and not self.path.is_symlink(),'State cannot be a symlink')
         if not self.path.exists():
             need(create,'State missing; run keycloak first, never discard an interrupted run directory')
             if self.directory.exists(): need(not list(self.directory.iterdir()),'Use a new empty run directory')
             self.directory.mkdir(mode=0o700,parents=True,exist_ok=True)
-            self.data = {'schema':1,'manifest':digest(c),'operation':str(uuid.uuid4()),
+            self.data = {'schema':2,'mode':MODE,'manifest':digest(c),'operation':str(uuid.uuid4()),
+                         'subjects':{u['username']:str(uuid.uuid4()) for u in c['users']},
                          'pending':[],'receipts':{}}
             fd = os.open(self.path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
             with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(self.data,f)
         else:
             self.data = json.loads(self.path.read_text(encoding='utf-8'),object_pairs_hook=w.unique_object)
-        need(self.data.get('schema')==1 and self.data.get('manifest')==digest(c),
-             'Manifest changed or wrong run directory; no automatic user/role migration')
+        need(self.data.get('schema')==2 and self.data.get('mode')==MODE and self.data.get('manifest')==digest(c),
+             'Old-mode state, changed manifest or wrong directory; no automatic adoption/migration')
         need(re.fullmatch(r'[a-f0-9-]{36}',self.data.get('operation','')),'Invalid state operation')
+
+        subjects=self.data.get('subjects',{})
+        need(set(subjects)=={u['username'] for u in c['users']}
+             and len(set(subjects.values()))==len(subjects)
+             and all(str(uuid.UUID(v))==v for v in subjects.values()),'Invalid stable subjects')
 
     def begin(self,key):
         """Checkpoint BEFORE a non-idempotent create; absence is not proof of failure."""
@@ -178,12 +192,16 @@ class State:
         """Record a verified resource identity; never accept a replacement."""
         old = self.data['receipts'].get(key)
         need(old is None or old==value,'Resource identity changed: '+key)
+        if self.readonly:
+            need(old==value,'Missing resource receipt: '+key)
+            return
         self.data['receipts'][key] = value
         if key in self.data['pending']: self.data['pending'].remove(key)
         self.save()
 
     def save(self):
         """Persist non-secret checkpoints atomically."""
+        need(not self.readonly,'Read-only state cannot be changed')
         private_write(self.path,self.data)
 
 
@@ -228,7 +246,7 @@ def clients(c,operation):
         'serviceAccountsEnabled':False,'fullScopeAllowed':False,'redirectUris':['http://localhost:18080'],
         'webOrigins':[],'attributes':{OWNER:operation,'pkce.code.challenge.method':'S256'},
         'defaultClientScopes':['basic','profile','email'],'optionalClientScopes':['offline_access'],
-        'protocolMappers':[]}
+        'protocolMappers':[m.subject_mapper()]}
     return [saml,desktop]
 
 
@@ -274,6 +292,12 @@ class Bootstrap:
         info = self.k('/admin/serverinfo')
         need(info['systemInfo']['version']=='26.6.4' and any(p['id']=='wecom' for p in info['identityProviders']),
              'Keycloak 26.6.4 community wecom plugin required')
+        need(m.MAPPER in info.get('providers',{}).get('identity-provider-mapper',{}).get('providers',{})
+             and sso.COOKIE in info.get('providers',{}).get('authenticator',{}).get('providers',{}),
+             'Install the mapped extension JAR and rebuild Keycloak first')
+        need(any(str(f).lower().replace('_','-')=='transient-users'
+                 for f in info.get('profileInfo',{}).get('experimentalFeatures',[])),
+             'Rebuild/start Keycloak with --features=transient-users')
         need(not self.k('/admin/realms/master').get('adminEventsDetailsEnabled'),
              'Master admin request-body logging must be disabled before credential provisioning')
         info = self.qs.describe_account_subscription(AwsAccountId=self.c['aws_account']).get('AccountInfo',{})
@@ -317,110 +341,118 @@ class Bootstrap:
         need(not any(u.get('Email','').casefold() in emails for u in users),'Existing Quick email; use association workflow, no new seat')
 
     def manifest(self):
-        """Read real UUIDs and derive per-user role pairs for the established SSO verifier."""
-        self.owned(); result={k:v for k,v in self.c.items() if k!='users'} | {'portal_managed':False,'users':[]}
-        found=self.k(self.root+'/users?first=0&max=100')
-        need(len(found)==len(self.c['users']),'Unexpected or missing employees in bootstrap Realm')
+        """Build approved mapping from durable subjects; never look up/create employees."""
+        realm=self.owned()
+        policy={key:self.c[key] for key in ('realm','corp_id','agent_id','aws_account')}
+        policy.update(schema=1,realm_id=realm['id'],alias=m.ALIAS,users=[])
         for u in self.c['users']:
-            matches=[x for x in found if x['username']==u['username']]
-            need(len(matches)==1,'Employee missing or ambiguous')
-            actual=self.k(self.root+'/users/'+matches[0]['id'])
-            need(actual.get('attributes',{}).get(OWNER)==[self.st.data['operation']],'Employee ownership mismatch')
-            prior=self.st.data['receipts'].get('user:'+u['username'])
-            need(prior is None or prior==actual['id'],'Employee UUID changed')
-            need(not self.k(self.root+'/users/'+actual['id']+'/credentials'),'Unexpected local credentials; do not reset or bypass')
-            role=self.ns['roles'][u['username']]
-            result['users'].append({k:u[k] for k in ('username','email','wecom_user_id')} | {
-                'kc_id':actual['id'],'role_arn':'arn:aws:iam::'+self.c['aws_account']+':role/'+role,
-                'provider_arn':self.ns['provider_arn'],'quick_username':role+'/'+u['username']})
-        return w.validate(result)
+            role='arn:aws:iam::'+self.c['aws_account']+':role/'+self.ns['roles'][u['username']]
+            policy['users'].append({key:u[key] for key in ('username','email','wecom_user_id')} |
+                {'subject':self.st.data['subjects'][u['username']],
+                 'role_pair':role+','+self.ns['provider_arn'],'enabled':True})
+        return m.validate_policy(policy)
+
+    def provider(self):
+        """Direct transient provider contract; no legacy IdP or link is created."""
+        return m.provider(w.provider(self.c))
+
+    def realm_settings(self):
+        """Restrict login to mapped broker and guarded transient session reuse."""
+        return {'enabled':True,'sslRequired':'all','registrationAllowed':False,
+            'registrationEmailAsUsername':False,'duplicateEmailsAllowed':False,'editUsernameAllowed':False,
+            'resetPasswordAllowed':False,'loginWithEmailAllowed':False,'rememberMe':False,
+            'bruteForceProtected':True,'failureFactor':5,'accessTokenLifespan':300,
+            'ssoSessionIdleTimeout':1800,'ssoSessionMaxLifespan':28800,'revokeRefreshToken':True,
+            'refreshTokenMaxReuse':2,'offlineSessionIdleTimeout':2592000,
+            'offlineSessionMaxLifespanEnabled':True,'offlineSessionMaxLifespan':5184000,
+            'defaultSignatureAlgorithm':'RS256','adminEventsEnabled':True,'adminEventsDetailsEnabled':False,
+            'browserFlow':sso.BROWSER,'directGrantFlow':m.DENY,'resetCredentialsFlow':m.DENY}
 
     def verify_keycloak(self):
-        """Check strict clients, profile, ownership and prelinked-only identity policy."""
-        c=self.manifest(); observed=w.inspect(c,self.k)
-        need(observed['approval']==w.desired_approval(c),'Apply approved broker bindings first')
-        for u in c['users']:
-            need(observed['links'][u['kc_id']]==[{'identityProvider':'wecom','userId':u['wecom_user_id'].lower(),
-                 'userName':u['wecom_user_id']}],'Missing exact binding')
+        """Read exact transient configuration, mapped flows, clients and zero-user invariant."""
+        policy=self.manifest();realm=self.owned()
+        need(self.k(self.root+'/users/count')==0,'Persistent employees found; fresh mode never deletes/adopts them')
+        need(all(realm.get(k)==v for k,v in self.realm_settings().items()),'Realm security/flow drift')
+        providers=self.k(self.root+'/identity-provider/instances')
+        need(len(providers)==1 and providers[0]['alias']==m.ALIAS,'Unexpected provider or legacy entrance')
+        p=self.k(self.root+'/identity-provider/instances/'+m.ALIAS);expected=self.provider()
+        for key,value in expected.items():
+            if key=='enabled':need(type(p.get(key)) is bool,'Invalid provider enabled state')
+            elif key=='config':
+                config=p.get('config',{})
+                need(all(config.get(a)==b for a,b in value.items()),'Transient provider config drift')
+                need(bool(config.get('clientSecret')),'Provider Secret missing')
+                need(all(a in value or a=='clientSecret' or
+                     (a in w.ENDPOINTS and b==w.ENDPOINTS[a]) for a,b in config.items()),
+                     'Unexpected provider endpoint/config override')
+            else:need(p.get(key)==value,'Transient provider drift: '+key)
+        need(not p.get('postBrokerLoginFlowAlias'),'Unexpected post-login flow')
+        strip=lambda x:{key:value for key,value in x.items() if key!='id'}
+        got=self.k(self.root+'/identity-provider/instances/'+m.ALIAS+'/mappers')
+        need(sorted([strip(x) for x in got],key=lambda x:x['name'])==
+             sorted(m.mappers(policy),key=lambda x:x['name']),'Approved identity mapping drift')
+        m.verify_flows(self.k,policy);sso.verify_flow(self.k,{'policy':policy})
+        profile=self.k(self.root+'/users/profile')
+        need(digest(profile)==self.st.data['receipts'].get('profile'),'Protected user profile drift')
         actual=self.k(self.root+'/clients')
         for expected in clients(self.c,self.st.data['operation']):
             found=[x for x in actual if x['clientId']==expected['clientId']]
             need(len(found)==1,'Missing generated client')
+            observed=self.k(self.root+'/clients/'+found[0]['id'])
+            need(not observed.get('authenticationFlowBindingOverrides'),'Unexpected client flow override')
             for key,value in expected.items():
-                got=found[0].get(key)
-                if key=='attributes': need(all((got or {}).get(k)==v for k,v in value.items()),'Client attributes drift')
+                got=observed.get(key)
+                if key=='attributes':need(all((got or {}).get(k)==v for k,v in value.items()),'Client attributes drift')
                 elif key=='protocolMappers':
-                    projection=[{k:m.get(k) for k in ('name','protocol','protocolMapper','config')} for m in got or []]
-                    need(sorted(projection,key=lambda m:m['name'])==sorted(value,key=lambda m:m['name']),'SAML mappers drift')
-                else: need(canonical(got)==canonical(value),'Client setting drift: '+key)
-        return c
+                    fields=('name','protocol','protocolMapper','config')
+                    projection=lambda rows:sorted([{k:r.get(k) for k in fields} for r in rows],key=lambda r:r['name'])
+                    need(projection(got or [])==projection(value),'Client identity mappers drift')
+                else:need(canonical(got)==canonical(value),'Client setting drift: '+key)
+        return policy
 
     def keycloak(self):
-        """Create an owned realm, passwordless employees and disabled prelinked broker."""
-        # Validate secret availability BEFORE creating any partial customer resources.
+        """Initialize a new zero-employee Realm; retry only fully verified checkpoints."""
+        self.preflight()
         param=self.s.client('ssm').get_parameter(Name=self.c['secret_parameter'],WithDecryption=True)['Parameter']
         need(param['Type']=='SecureString' and re.fullmatch(r'[A-Za-z0-9_-]{32,128}',param['Value']),
              'Expected SecureString app Secret')
         operation=self.st.data['operation'];r=optional_kc(self.k,self.root)
         if r is None:
             self.check_fresh();self.st.begin('realm')
-            self.k('/admin/realms','POST',{'realm':self.c['realm'],'enabled':True,'sslRequired':'all',
-                'registrationAllowed':False,'duplicateEmailsAllowed':False,'editUsernameAllowed':False,
-                'resetPasswordAllowed':False,'loginWithEmailAllowed':True,'rememberMe':False,
-                'bruteForceProtected':True,'failureFactor':5,'accessTokenLifespan':300,
-                'ssoSessionIdleTimeout':1800,'ssoSessionMaxLifespan':28800,'revokeRefreshToken':True,
-                'refreshTokenMaxReuse':2,'offlineSessionIdleTimeout':2592000,
-                'offlineSessionMaxLifespanEnabled':True,'offlineSessionMaxLifespan':5184000,
-                'defaultSignatureAlgorithm':'RS256','adminEventsEnabled':True,'adminEventsDetailsEnabled':False,
+            settings={k:v for k,v in self.realm_settings().items()
+                      if k not in ('browserFlow','directGrantFlow','resetCredentialsFlow')}
+            self.k('/admin/realms','POST',{'realm':self.c['realm'],**settings,
                 'attributes':{OWNER:operation},'clients':clients(self.c,operation)})
         r=self.owned();self.st.done('realm',r['id'])
-        profile=self.k(self.root+'/users/profile')
-        if 'profile' not in self.st.data['receipts']:
-            for a in profile['attributes']:
-                if a['name'] in ('username','email'):
-                    a['permissions']={'view':['admin','user'],'edit':['admin']}
-                if a['name'] in ('email','firstName','lastName'): a.pop('required',None)
-            for name in (OWNER,'quickRolePair'):
-                need(not any(a['name']==name for a in profile['attributes']),'Unexpected preexisting bootstrap profile field')
-                profile['attributes'].append({'name':name,'permissions':{'view':['admin'],'edit':['admin']},'multivalued':False})
-            self.k(self.root+'/users/profile','PUT',profile)
-            profile=self.k(self.root+'/users/profile');self.st.done('profile',digest(profile))
-        need(digest(profile)==self.st.data['receipts']['profile'],'User profile changed')
-        found=self.k(self.root+'/users?first=0&max=100')
-        need(all(x['username'] in {u['username'] for u in self.c['users']} for x in found),'Unexpected existing employee')
-        for u in self.c['users']:
-            matches=[x for x in found if x['username']==u['username']]
-            if not matches:
-                key='user:'+u['username'];self.st.begin(key)
-                role='arn:aws:iam::'+self.c['aws_account']+':role/'+self.ns['roles'][u['username']]
-                self.k(self.root+'/users','POST',{'username':u['username'],'email':u['email'],
-                    'enabled':True,'emailVerified':True,'requiredActions':[],
-                    'attributes':{OWNER:[operation],'quickRolePair':[role+','+self.ns['provider_arn']]}})
-            # Re-read complete inventory, including after a lost response on a prior run.
-            found=self.k(self.root+'/users?first=0&max=100')
-            matches=[x for x in found if x['username']==u['username']]
-            need(len(matches)==1,'Employee create not yet visible; keep run directory')
-            full=self.k(self.root+'/users/'+matches[0]['id'])
-            need(full.get('attributes',{}).get(OWNER)==[operation],'Conflicting employee')
-            self.st.done('user:'+u['username'],full['id'])
-        c=self.manifest();before=w.inspect(c,self.k)
-        complete=before['approval']==w.desired_approval(c) and all(before['links'].values())
-        if not complete:
+        need(self.k(self.root+'/users/count')==0,'Fresh mode requires zero persistent employees')
+        policy=self.manifest()
+        if 'broker' not in self.st.data['receipts']:
             self.st.begin('broker')
-            w.apply(c,self.k,before,param['Value']);param=None
-        self.verify_keycloak();self.st.done('broker',True)
-        self.outputs(c)
-        return {'keycloak_ready':True,'next':'aws','paid_users_created':False}
+            # Any interrupted configuration stops at the journal gate on retry.
+            # Never fabricate an old-user migration/retirement snapshot.
+            m.create_flows(self.k,policy);sso.create_flow(self.k,policy)
+            self.k(self.root+'/users/profile','PUT',m.profile(self.k(self.root+'/users/profile')))
+            self.st.done('profile',digest(self.k(self.root+'/users/profile')))
+            p=self.provider();p['config']['clientSecret']=param['Value']
+            self.k(self.root+'/identity-provider/instances','POST',p)
+            for mapper in m.mappers(policy):
+                self.k(self.root+'/identity-provider/instances/'+m.ALIAS+'/mappers','POST',mapper)
+            self.k(self.root,'PUT',self.realm_settings())
+            self.verify_keycloak();self.st.done('broker',m.fingerprint(policy))
+        else:
+            self.verify_keycloak()
+            need(self.st.data['receipts']['broker']==m.fingerprint(policy),'Policy baseline changed')
+        param=None;self.outputs(policy)
+        return {'keycloak_ready':True,'persistent_employee_count':0,'next':'aws','paid_users_created':False}
 
-    def outputs(self,c):
-        """Save real UUIDs, public metadata and manual-console values without secrets."""
+    def outputs(self,policy):
+        """Save private approved mappings, public metadata and manual-console parameters."""
         issuer=self.c['origin']+'/realms/'+self.c['realm']
         raw=self.k('/realms/'+self.c['realm']+'/protocol/saml/descriptor',raw=True)
         metadata_identity(raw,issuer)
         private_write(self.st.directory/'metadata.xml',raw.decode())
-        private_write(self.st.directory/'existing-wecom.json',c)
+        private_write(self.st.directory/'approved-mapping.json',policy)
         private_write(self.st.directory/'parameters.json',plan(self.c)['parameters'])
-        private_write(self.st.directory/'employees.json',c['users'])
 
     def aws(self):
         """Create one named stack once; subsequent calls observe, never update/recreate."""
@@ -497,15 +529,20 @@ class Bootstrap:
              and actual.get('PhysicalResourceId')==physical and actual.get('ResourceType')==resource_type
              and actual.get('ResourceStatus')=='CREATE_COMPLETE','CloudFormation resource ownership mismatch')
 
-    def quick_user(self,u,listed):
-        """Verify one registered IAM user and deployment tags; never auto-associate."""
+    def quick_user(self,u,listed,require_active=False):
+        """Verify one owned IAM seat; require_active is only for post-login acceptance.
+
+        Returns the stable identity receipt or None when absent. Raises ValueError
+        on identity/license/ownership drift, never auto-associates another seat.
+        """
         name=self.ns['roles'][u['username']]+'/'+u['username']
         matches=[x for x in listed if x.get('UserName')==name or x.get('Email','').casefold()==u['email'].casefold()]
         if not matches: return None
         need(len(matches)==1 and matches[0]['UserName']==name,'Conflicting Quick name/email; no association performed')
         actual=self.qs.describe_user(AwsAccountId=self.c['aws_account'],Namespace='default',UserName=name)['User']
         need(actual['UserName']==name and actual['Email']==u['email'] and actual['Role']==u['quick_role']
-             and actual['IdentityType']=='IAM' and actual.get('Active') is True
+             and actual['IdentityType']=='IAM' and type(actual.get('Active')) is bool
+             and (not require_active or actual['Active'])
              and actual['PrincipalId']=='federated/iam/'+self.st.data['receipts']['role:'+u['username']]+':'+u['username'],
              'Quick identity/role inactive or changed; inspect instead of re-registering')
         tags={x['Key']:x['Value'] for x in self.qs.list_tags_for_resource(ResourceArn=actual['Arn'])['Tags']}
@@ -539,8 +576,12 @@ class Bootstrap:
         return {'paid_users_verified':len(self.c['users']),'next':'Complete Quick console settings, then enable'}
 
     def verify_registered(self,c):
-        """Verify registered identities; shadow deployments provide their own JIT contract."""
-        w.aws_check(c,self.k,self.s)
+        """Require owned Quick identities; pending first login is not permission to re-enroll."""
+        listed=self.all_quick_users()
+        for u in self.c['users']:
+            got=self.quick_user(u,listed)
+            need(got is not None and self.st.data['receipts'].get('quick:'+u['username'])==got,
+                 'Paid-user receipt missing or changed')
 
     def enable(self,wecom_confirmed,quick_confirmed):
         """Enable only after exact identity checks and both human console gates."""
@@ -550,20 +591,34 @@ class Bootstrap:
             got=self.quick_user(u,listed)
             need(got is not None and self.st.data['receipts'].get('quick:'+u['username'])==got,'Paid-user receipt missing or changed')
         self.verify_registered(c)
-        p=self.k(self.root+'/identity-provider/instances/wecom')
+        p=self.k(self.root+'/identity-provider/instances/'+m.ALIAS)
         need(bool(p.get('config',{}).get('clientSecret')),'Provider Secret missing')
-        p['enabled']=True;self.k(self.root+'/identity-provider/instances/wecom','PUT',p)
-        need(self.k(self.root+'/identity-provider/instances/wecom')['enabled'] is True,'Enable readback failed')
+        p['enabled']=True;self.k(self.root+'/identity-provider/instances/'+m.ALIAS,'PUT',p)
+        need(self.k(self.root+'/identity-provider/instances/'+m.ALIAS)['enabled'] is True,'Enable readback failed')
         return {'provider_enabled':True,'real_qr_login_verified':False,'next':'verify, then human scan and logout/relogin'}
+
+    def verify(self,require_active=False,route_check=False):
+        """Read-only local/remote audit; route checking is optional and creates login sessions."""
+        need(self.st.readonly,'Verification requires read-only state')
+        policy=self.verify_keycloak();self.verify_iam(policy);self.verify_registered(policy)
+        listed=self.all_quick_users()
+        for u in self.c['users']:self.quick_user(u,listed,require_active=require_active)
+        enabled=self.k(self.root+'/identity-provider/instances/'+m.ALIAS)['enabled']
+        if route_check:
+            need(enabled,'Enable mapped provider before route check')
+            w.verify_http(self.c,alias=m.ALIAS)
+        return {'configuration_verified':True,'provider_enabled':enabled,'persistent_employee_count':0,
+            'policy_fingerprint':m.fingerprint(policy),'quick_active_required':require_active,
+            'route_checked':route_check,'remote_configuration_writes':False,'real_qr_login_verified':False}
 
     def disable(self):
         """Emergency rollback of this broker only; do not delete users, sessions or seats."""
-        self.owned();p=self.k(self.root+'/identity-provider/instances/wecom')
-        need(p.get('alias')=='wecom' and p.get('providerId')=='wecom'
+        self.owned();p=self.k(self.root+'/identity-provider/instances/'+m.ALIAS)
+        need(p.get('alias')==m.ALIAS and p.get('providerId')=='wecom'
              and p.get('config',{}).get('clientId')==self.c['corp_id']
              and p.get('config',{}).get('agentId')==self.c['agent_id'],'Rollback target mismatch')
-        p['enabled']=False;self.k(self.root+'/identity-provider/instances/wecom','PUT',p)
-        need(self.k(self.root+'/identity-provider/instances/wecom')['enabled'] is False,'Disable readback failed')
+        p['enabled']=False;self.k(self.root+'/identity-provider/instances/'+m.ALIAS,'PUT',p)
+        need(self.k(self.root+'/identity-provider/instances/'+m.ALIAS)['enabled'] is False,'Disable readback failed')
         return {'provider_enabled':False,'existing_sessions_revoked':False,'billing_stopped':False}
 
 
@@ -594,9 +649,10 @@ def main():
     p.add_argument('--admin-secret-id');p.add_argument('--confirm-target')
     p.add_argument('--confirm-paid-users');p.add_argument('--wecom-console-confirmed',action='store_true')
     p.add_argument('--quick-console-confirmed',action='store_true')
+    p.add_argument('--require-active',action='store_true',help='Require Quick Active=true after the first real login')
+    p.add_argument('--route-check',action='store_true',help='Also start public SAML/OIDC login sessions; no scan')
     a=p.parse_args();c=validate(json.loads(Path(a.config).read_text(encoding='utf-8'),object_pairs_hook=w.unique_object))
     if a.command=='plan': print(json.dumps(plan(c),ensure_ascii=False,indent=2));return
-    if a.command=='verify': print(json.dumps(w.verify_http(c)));return
     mutating=a.command in ('keycloak','aws','users','enable','disable')
     if mutating: need(a.confirm_target==c['aws_account']+'/'+c['realm'],'Use exact --confirm-target from plan')
     if a.command=='users': need(a.confirm_paid_users==paid_confirmation(c),'Use exact --confirm-paid-users from reviewed plan')
@@ -610,7 +666,7 @@ def main():
     need(session.client('sts').get_caller_identity()['Account']==c['aws_account'],'AWS account mismatch')
     k=authenticate(c,session,a.admin_secret_id)
     st=None
-    if a.command!='check' or (Path(a.directory)/'state.json').exists(): st=State(a.directory,c,create=a.command=='keycloak')
+    if a.command!='check' or (Path(a.directory)/'state.json').exists(): st=State(a.directory,c,create=a.command=='keycloak',readonly=a.command in ('check','verify'))
     runner=Bootstrap(c,k,session,st)
     lock=None
     try:
@@ -628,6 +684,7 @@ def main():
                 runner.check_fresh()
             result={'checks_passed':True,'phase':'existing bootstrap Keycloak' if initialized else 'fresh targets',
                     'remote_writes':False,'actual_login_verified':False}
+        elif a.command=='verify': result=runner.verify(a.require_active,a.route_check)
         elif a.command=='users': result=runner.users(a.confirm_paid_users)
         elif a.command=='enable': result=runner.enable(a.wecom_console_confirmed,a.quick_console_confirmed)
         else: result=getattr(runner,a.command)()

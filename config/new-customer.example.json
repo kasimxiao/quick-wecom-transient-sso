@@ -9,6 +9,6 @@
   "secret_parameter": "/customer-quick/wecom-secret",
   "saml_alias": "quick-web",
   "users": [
-    {"username": "employee-one", "email": "employee.one@example.com", "wecom_user_id": "MemberOne", "quick_role": "READER_PRO"}
+    {"username": "employee-one", "email": "employee.one@example.com", "wecom_user_id": "memberone", "quick_role": "READER_PRO"}
   ]
 }

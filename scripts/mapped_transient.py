@@ -1,7 +1,8 @@
 """Configuration primitives for approved, transient-only WeCom mappings.
 
 This module never creates/deletes employees or Quick seats and never calls AWS.
-Migration policies must be resolved from verified existing identity contracts.
+Fresh policies come from private bootstrap state. Migration policies must be
+resolved from verified existing identity contracts, never random replacement IDs.
 """
 import copy
 import hashlib
@@ -181,13 +182,27 @@ def prepare(k,snapshot,secret):
     need(info['systemInfo']['version']=='26.6.4')
     need(MAPPER in info.get('providers',{}).get('identity-provider-mapper',{}).get('providers',{}))
     need(any(str(f).lower().replace('_','-')=='transient-users' for f in info.get('profileInfo',{}).get('experimentalFeatures',[])))
-    specs,configs=flows(policy);by_alias={x['alias']:x for x in specs};cfgs={x['alias']:x for x in configs}
+    specs,configs=flows(policy);by_alias={x['alias']:x for x in specs}
     existing=k(root+'/authentication/flows')
     need(not any(f['alias'] in by_alias for f in existing))
     need(not any(p['alias']==ALIAS for p in k(root+'/identity-provider/instances')))
     need(snapshot['desktop'].get('protocolMappers',[])==[])
     need(k(root+'/users/profile')==snapshot['profile'])
 
+    create_flows(k,policy)
+    k(root+'/users/profile','PUT',profile(snapshot['profile']))
+    p=provider(snapshot['provider']);p['config']['clientSecret']=secret
+    k(root+'/identity-provider/instances','POST',p)
+    for mapper in mappers(policy):k(root+'/identity-provider/instances/'+ALIAS+'/mappers','POST',mapper)
+    k(root+'/clients/'+snapshot['desktop']['id']+'/protocol-mappers/models','POST',subject_mapper())
+    verify(k,snapshot,active=False)
+
+
+def create_flows(k,policy):
+    """Create restrictive flows once; caller journals partial failures before invoking."""
+    root='/admin/realms/'+policy['realm']
+    specs,configs=flows(policy);by_alias={x['alias']:x for x in specs};cfgs={x['alias']:x for x in configs}
+    need(not any(f['alias'] in by_alias for f in k(root+'/authentication/flows')))
     def children(spec):
         path=root+'/authentication/flows/'+spec['alias']+'/executions'
         for execution in spec['authenticationExecutions']:
@@ -211,12 +226,6 @@ def prepare(k,snapshot,secret):
         k(root+'/authentication/flows','POST',{key:spec[key] for key in ('alias','providerId','topLevel','builtIn')}
             |{'description':'Approved mapping '+fingerprint(policy)})
         children(spec)
-    k(root+'/users/profile','PUT',profile(snapshot['profile']))
-    p=provider(snapshot['provider']);p['config']['clientSecret']=secret
-    k(root+'/identity-provider/instances','POST',p)
-    for mapper in mappers(policy):k(root+'/identity-provider/instances/'+ALIAS+'/mappers','POST',mapper)
-    k(root+'/clients/'+snapshot['desktop']['id']+'/protocol-mappers/models','POST',subject_mapper())
-    verify(k,snapshot,active=False)
 
 
 def verify(k,snapshot,active,browser_flow=BROWSER):
@@ -233,18 +242,7 @@ def verify(k,snapshot,active,browser_flow=BROWSER):
     got=k(root+'/identity-provider/instances/'+ALIAS+'/mappers')
     strip=lambda x:{key:value for key,value in x.items() if key!='id'}
     need(sorted([strip(x) for x in got],key=lambda x:x['name'])==sorted(mappers(policy),key=lambda x:x['name']))
-    specs,configs=flows(policy);cfgs={x['alias']:x['config'] for x in configs}
-    for spec in specs:
-        entries=[e for e in k(root+'/authentication/flows/'+spec['alias']+'/executions') if e.get('level',0)==0]
-        need(len(entries)==len(spec['authenticationExecutions']))
-        for got,want in zip(entries,spec['authenticationExecutions']):
-            need(got['requirement']==want['requirement'] and bool(got.get('authenticationFlow'))==want['authenticatorFlow'])
-            if want['authenticatorFlow']:need(got['displayName']==want['flowAlias'])
-            else:need(got['providerId']==want['authenticator'])
-            if want.get('authenticatorConfig'):
-                cfg=k(root+'/authentication/config/'+got['authenticationConfig'])
-                need(cfg['config']==cfgs[want['authenticatorConfig']])
-            else:need(not got.get('authenticationConfig'))
+    verify_flows(k,policy)
     desktop=k(root+'/clients/'+snapshot['desktop']['id'])
     need([strip(x) for x in desktop.get('protocolMappers',[])]==[subject_mapper()])
     need({a:b for a,b in desktop.items() if a!='protocolMappers'}=={a:b for a,b in snapshot['desktop'].items() if a!='protocolMappers'})
@@ -263,6 +261,23 @@ def verify(k,snapshot,active,browser_flow=BROWSER):
     need(k(root+'/identity-provider/instances/wecom/mappers')==snapshot['provider_mappers'])
     return {'configuration_verified':True,'active':active,'historical_users_unchanged':not bool(retired),
         'legacy_users_removed':bool(retired),'persistent_employee_count':count,'policy_fingerprint':fingerprint(policy)}
+
+
+def verify_flows(k,policy):
+    """Read exact execution order and gate configs; never changes a Realm."""
+    root='/admin/realms/'+policy['realm']
+    specs,configs=flows(policy);cfgs={x['alias']:x['config'] for x in configs}
+    for spec in specs:
+        entries=[e for e in k(root+'/authentication/flows/'+spec['alias']+'/executions') if e.get('level',0)==0]
+        need(len(entries)==len(spec['authenticationExecutions']))
+        for got,want in zip(entries,spec['authenticationExecutions']):
+            need(got['requirement']==want['requirement'] and bool(got.get('authenticationFlow'))==want['authenticatorFlow'])
+            if want['authenticatorFlow']:need(got['displayName']==want['flowAlias'])
+            else:need(got['providerId']==want['authenticator'])
+            if want.get('authenticatorConfig'):
+                cfg=k(root+'/authentication/config/'+got['authenticationConfig'])
+                need(cfg['config']==cfgs[want['authenticatorConfig']])
+            else:need(not got.get('authenticationConfig'))
 
 
 def enable(k,snapshot):

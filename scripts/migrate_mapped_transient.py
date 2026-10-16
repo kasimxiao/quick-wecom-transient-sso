@@ -5,6 +5,7 @@ Requires a customer manifest from new_customer.py and an administrator-owned
 private snapshot. Custom mapper image must be installed before prepare.
 """
 import argparse
+import copy
 import base64
 import json
 import os
@@ -17,6 +18,16 @@ import urllib.error
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_transient as m
+
+
+def legacy_manifest(value):
+    """Normalize legacy UserId spelling without changing an existing identity contract."""
+    c=copy.deepcopy(value)
+    if isinstance(c,dict) and isinstance(c.get('users'),list):
+        for user in c['users']:
+            if isinstance(user,dict) and isinstance(user.get('wecom_user_id'),str):
+                user['wecom_user_id']=user['wecom_user_id'].lower()
+    return n.validate(c)
 
 
 class ManagedKeycloak:
@@ -115,7 +126,7 @@ def main():
     p.add_argument('stage',choices=['snapshot','check','prepare','enable','verify','rollback'])
     p.add_argument('--config',required=True);p.add_argument('--snapshot',required=True)
     p.add_argument('--admin-secret-id');p.add_argument('--confirm-target');p.add_argument('--active',action='store_true')
-    args=p.parse_args();c=n.validate(json.loads(Path(args.config).read_text()))
+    args=p.parse_args();c=legacy_manifest(json.loads(Path(args.config).read_text(),object_pairs_hook=n.w.unique_object))
     import boto3
     session=boto3.Session(region_name=c['region']);k=authenticate(c,session,args.admin_secret_id)
     if args.stage in ('prepare','enable','rollback'):
