@@ -36,3 +36,14 @@ mapped-private/
 *.jks
 *.p12
 *.pfx
+# Maintainer-only diagnostics and test evidence stay outside customer delivery.
+/tests/
+/test-output/
+/verification/
+/evidence/
+/backups/
+/artifacts/
+/playwright-report/
+/test-results/
+*.trace
+*.bak

@@ -6,6 +6,7 @@ to read-only. Apply adds only a deny-only broker flow, provider and explicit lin
 Requires Python 3.10+, boto3, and approved AWS/Keycloak administrative access.
 """
 import argparse
+import base64
 import copy
 import getpass
 import hashlib
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -102,7 +104,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 class Keycloak:
     """HTTPS Keycloak client using a short-lived in-memory bearer token."""
     def __init__(self, origin):
-        self.origin=origin; self.token=None
+        self.origin=origin; self.token=None; self.refresh_token=None
         self.opener=urllib.request.build_opener(NoRedirect(),urllib.request.ProxyHandler({}))
 
     def __call__(self,path,method='GET',body=None,form=False,raw=False):
@@ -115,8 +117,50 @@ class Keycloak:
 
     def login(self, credentials):
         """Exchange approved admin credentials; never print the response."""
-        self.token=self('/realms/master/protocol/openid-connect/token','POST',
-            {'grant_type':'password','client_id':'admin-cli','username':credentials['username'],'password':credentials['password']},form=True)['access_token']
+        tokens=self('/realms/master/protocol/openid-connect/token','POST',
+            {'grant_type':'password','client_id':'admin-cli','username':credentials['username'],'password':credentials['password']},form=True)
+        self.token=tokens['access_token'];self.refresh_token=tokens.get('refresh_token')
+
+    def refresh(self):
+        """Renew this admin-cli session in memory without retaining the password.
+
+        Returns the client with rotated tokens. Raises on a missing or rejected
+        refresh token; no password prompt, MFA bypass or uncertain write retry.
+        """
+        need(bool(self.refresh_token),'Admin session cannot be renewed; authenticate again')
+        tokens=self('/realms/master/protocol/openid-connect/token','POST',
+            {'grant_type':'refresh_token','client_id':'admin-cli','refresh_token':self.refresh_token},form=True)
+        self.token=tokens['access_token'];self.refresh_token=tokens.get('refresh_token')
+        return self
+
+
+class ManagedKeycloak:
+    """Renew before expiry and retry one explicit 401, never uncertain writes.
+
+    Args:
+        factory (callable): Return a freshly authenticated or refreshed client.
+        renewable (bool): False preserves a caller-supplied static token.
+        clock (callable | None): Unix-seconds clock, injectable for tests.
+        client (Keycloak | None): Optional already-authenticated first client.
+    """
+    def __init__(self,factory,renewable=True,clock=None,client=None):
+        self.factory=factory;self.renewable=renewable;self.clock=clock or time.time
+        self.client=client if client is not None else factory()
+
+    def __call__(self,path,method='GET',body=None,**kwargs):
+        try:
+            payload=self.client.token.split('.')[1]
+            expires=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))['exp']
+            if type(expires) not in (int,float):expires=float('inf')
+        except (AttributeError,IndexError,KeyError,TypeError,ValueError):expires=float('inf')
+        if self.renewable and expires-self.clock()<15:self.client=self.factory()
+        try:return self.client(path,method,body,**kwargs)
+        except urllib.error.HTTPError as error:
+            # 401 rejects the request before the operation. Timeouts, disconnects,
+            # 403 and server errors must not replay potentially completed writes.
+            if error.code!=401 or not self.renewable:raise
+            self.client=self.factory()
+            return self.client(path,method,body,**kwargs)
 
 
 def mapper_value(client, name, u):

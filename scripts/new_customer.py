@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import uuid
 import warnings
@@ -236,6 +237,7 @@ def clients(c,operation):
         'attributes':{OWNER:operation,'saml_idp_initiated_sso_url_name':c['saml_alias'],
             'saml_idp_initiated_sso_relay_state':HOME_URL,'saml_assertion_consumer_url_post':ACS,
             'saml.force.post.binding':'true','saml.server.signature':'true','saml.assertion.signature':'true',
+            'saml.encrypt':'false','saml.artifact.binding':'false',
             'saml.client.signature':'false','saml.signature.algorithm':'RSA_SHA256',
             'saml_name_id_format':'username','saml_force_name_id_format':'true','saml.authnstatement':'true'},
         'protocolMappers':[mapper('AWS role','Role','quickRolePair','saml-user-attribute-mapper'),
@@ -402,7 +404,12 @@ class Bootstrap:
             need(not observed.get('authenticationFlowBindingOverrides'),'Unexpected client flow override')
             for key,value in expected.items():
                 got=observed.get(key)
-                if key=='attributes':need(all((got or {}).get(k)==v for k,v in value.items()),'Client attributes drift')
+                if key=='attributes':
+                    # Older runs relied on Keycloak's false defaults for these
+                    # flags; accept omission but never an enabled override.
+                    optional_false={'saml.encrypt','saml.artifact.binding'} if expected['protocol']=='saml' else set()
+                    need(all(((got or {}).get(k) in (None,'false') if k in optional_false
+                              else (got or {}).get(k)==v) for k,v in value.items()),'Client attributes drift')
                 elif key=='protocolMappers':
                     fields=('name','protocol','protocolMapper','config')
                     projection=lambda rows:sorted([{k:r.get(k) for k in fields} for r in rows],key=lambda r:r['name'])
@@ -550,6 +557,36 @@ class Bootstrap:
         need(not actual.get('CustomPermissionsName'),'Unexpected Quick custom permissions')
         return {k:actual[k] for k in ('Arn','UserName','Email','Role','PrincipalId')}
 
+    def registration_readback(self,u):
+        """Wait only for read visibility after an acknowledged RegisterUser.
+
+        Args:
+            u (dict): Approved employee in this deployment's pending batch.
+        Returns:
+            dict: Fully verified IAM identity, license and deployment receipt.
+        Raises:
+            ValueError: Visibility stays incomplete or identity/ownership differs.
+            Exception: Any service error other than explicit resource-not-found.
+
+        Never repeats registration, changes tags or relaxes identity checks.
+        Six read attempts wait at most 30 seconds, excluding API request time.
+        """
+        key='quick:'+u['username']
+        need(key in self.st.data['pending'] and key not in self.st.data['receipts'],
+             'Readback requires a pending, acknowledged registration')
+        for delay in (0,1,2,4,8,15):
+            if delay:time.sleep(delay)
+            try:
+                actual=self.quick_user(u,self.all_quick_users())
+            except Exception as error:
+                if getattr(error,'response',{}).get('Error',{}).get('Code')!='ResourceNotFoundException':raise
+                actual=None
+            if actual is not None:return actual
+            if delay==0:
+                print('Registration acknowledged; waiting for read-only user/tag visibility.',file=sys.stderr)
+        raise ValueError('Registration visibility incomplete; keep the original run directory, inspect identity/tags, '
+                         'then rerun the same users command to reconcile; do not re-register or edit pending state')
+
     def users(self,confirmation):
         """Create only a separately approved paid batch, checkpointing every registration."""
         need(confirmation==paid_confirmation(self.c),'Paid-user confirmation missing/mismatched; no seats created')
@@ -569,8 +606,7 @@ class Bootstrap:
                     IamArn='arn:aws:iam::'+self.c['aws_account']+':role/'+self.ns['roles'][u['username']],
                     SessionName=u['username'],Email=u['email'],UserRole=u['quick_role'],
                     Tags=[{'Key':'QuickSSODeployment','Value':self.st.data['operation']}])
-                actual=self.quick_user(u,self.all_quick_users())
-                need(actual is not None,'Registration not yet visible; keep run directory and inspect')
+                actual=self.registration_readback(u)
             self.st.done(key,actual)
         self.verify_registered(c)
         return {'paid_users_verified':len(self.c['users']),'next':'Complete Quick console settings, then enable'}
@@ -623,21 +659,32 @@ class Bootstrap:
 
 
 def authenticate(c,session,secret_id):
-    """Obtain a short-lived admin token without echo, redirect, argv secret or MFA bypass."""
+    """Authenticate and renew only the approved admin credential source.
+
+    Static environment tokens stay untouched. Secret-backed sessions re-read
+    the approved secret; interactive sessions use the in-memory refresh token
+    without retaining the password. No server token-lifetime changes are made.
+    """
     k=w.Keycloak(c['origin']);k.token=os.environ.get('QUICK_SSO_ADMIN_TOKEN')
-    if not k.token:
-        if secret_id:
-            if secret_id.startswith('arn:'):
-                need(secret_id.startswith('arn:aws:secretsmanager:'+c['region']+':'+c['aws_account']+':secret:'),'Admin credential must belong to target account/region')
+    if k.token:return k
+    if secret_id:
+        if secret_id.startswith('arn:'):
+            need(secret_id.startswith('arn:aws:secretsmanager:'+c['region']+':'+c['aws_account']+':secret:'),'Admin credential must belong to target account/region')
+        def factory():
+            client=w.Keycloak(c['origin'])
             credentials=json.loads(session.client('secretsmanager').get_secret_value(SecretId=secret_id)['SecretString'])
-        else:
-            need(sys.stdin.isatty(),'Use approved QUICK_SSO_ADMIN_TOKEN or --admin-secret-id for unattended execution')
-            with warnings.catch_warnings():
-                warnings.simplefilter('error',getpass.GetPassWarning)
-                credentials={'username':input('Keycloak administrator: ').strip(),
-                             'password':getpass.getpass('Keycloak password (hidden): ')}
-        k.login(credentials);credentials=None
-    return k
+            try:client.login(credentials)
+            finally:credentials=None
+            return client
+        return w.ManagedKeycloak(factory)
+    need(sys.stdin.isatty(),'Use approved QUICK_SSO_ADMIN_TOKEN or --admin-secret-id for unattended execution')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error',getpass.GetPassWarning)
+        credentials={'username':input('Keycloak administrator: ').strip(),
+                     'password':getpass.getpass('Keycloak password (hidden): ')}
+    try:k.login(credentials)
+    finally:credentials=None
+    return w.ManagedKeycloak(k.refresh,renewable=bool(k.refresh_token),client=k)
 
 
 def main():

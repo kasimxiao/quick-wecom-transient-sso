@@ -6,18 +6,17 @@ private snapshot. Custom mapper image must be installed before prepare.
 """
 import argparse
 import copy
-import base64
 import json
 import os
 from pathlib import Path
 import sys
-import time
 import traceback
 import urllib.error
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import new_customer as n
 import mapped_transient as m
+from wecom_sso import ManagedKeycloak
 
 
 def legacy_manifest(value):
@@ -30,30 +29,9 @@ def legacy_manifest(value):
     return n.validate(c)
 
 
-class ManagedKeycloak:
-    """Renew short-lived admin tokens before calls; never retry uncertain writes."""
-    def __init__(self,factory,renewable=True,clock=time.time):
-        self.factory=factory;self.renewable=renewable;self.clock=clock
-        self.client=factory()
-
-    def __call__(self,path,method='GET',body=None,**kwargs):
-        try:
-            payload=self.client.token.split('.')[1]
-            expires=json.loads(base64.urlsafe_b64decode(payload+'='*(-len(payload)%4)))['exp']
-        except (AttributeError,IndexError,KeyError,TypeError,ValueError):expires=float('inf')
-        if self.renewable and expires-self.clock()<15:self.client=self.factory()
-        try:return self.client(path,method,body,**kwargs)
-        except urllib.error.HTTPError as error:
-            # A received 401 is a rejected request, not an uncertain POST. Do
-            # not replay on timeout, disconnect, 403, 409 or server errors.
-            if error.code!=401 or not self.renewable:raise
-            self.client=self.factory()
-            return self.client(path,method,body,**kwargs)
-
-
 def authenticate(c,session,secret_id):
-    return ManagedKeycloak(lambda:n.authenticate(c,session,secret_id),
-        renewable=bool(secret_id) and not bool(os.environ.get('QUICK_SSO_ADMIN_TOKEN')))
+    """Share the bootstrap token lifecycle without nesting renewal wrappers."""
+    return n.authenticate(c,session,secret_id)
 
 
 def write_private(path,value):
@@ -85,10 +63,13 @@ def contracts(c,k,s,policy):
         provider=iam.get_saml_provider(SAMLProviderArn=providerarn)
         n.need(n.metadata_identity(provider.get('SAMLMetadataDocument',''),issuer)==metadata,
             'IAM metadata/signing certificate differs from current Keycloak')
-        quick=qs.describe_user(AwsAccountId=c['aws_account'],Namespace='default',
-            UserName=role['RoleName']+'/'+entry['username'])['User']
+        username=role['RoleName']+'/'+entry['username']
+        n.need(isinstance(role.get('RoleId'),str) and bool(role['RoleId']),'Current IAM RoleId missing')
+        principal='federated/iam/'+role['RoleId']+':'+entry['username']
+        quick=qs.describe_user(AwsAccountId=c['aws_account'],Namespace='default',UserName=username)['User']
         n.need(quick['Active'] and quick['IdentityType']=='IAM' and quick['Email']==entry['email']
-            and quick['Role']==u['quick_role'],'Existing Quick identity mismatch')
+            and quick['Role']==u['quick_role'] and quick.get('UserName')==username
+            and quick.get('PrincipalId')==principal,'Existing Quick identity/RoleId mismatch')
 
 
 def snapshot(c,k):

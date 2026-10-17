@@ -32,9 +32,13 @@ LICENSE      使用许可
 
 根目录不放开发源码、测试工程、构建工具或实施过程记录；扩展已编译，无需安装 Maven / Node.js。
 
+仓库只保留客户实施需要的内容。验证日志、真实环境截图、备份、运行状态和旧交付包不纳入 Git；手册引用的示例截图保留。
+
 ## 下载后先做什么
 
-离线交付包文件名为 `quick-wecom-transient-sso-v1.1.0.zip`，解压后打开包内 `quick-wecom-transient-sso/README.html`。源码下载也含运行脚本和 JAR，Markdown 手册可直接在 GitHub 阅读；离线包额外包含 HTML。
+需要最新脚本修复时，使用 GitHub **main 分支 → Code → Download ZIP**，解压后从 `README.md` 开始；源码包含运行脚本和 JAR，Markdown 图文手册可直接在 GitHub 阅读。
+
+固定版本离线交付包 `quick-wecom-transient-sso-v1.1.0.zip` 额外包含 HTML，解压后打开包内 `quick-wecom-transient-sso/README.html`。**推送 main 不会自动更新已发布的离线包**；不要把旧包解压覆盖最新脚本。
 
 在项目根目录执行以下命令，只查看示例计划，不访问云资源：
 
